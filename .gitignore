@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Datos runtime -- se generan solos al correr el sistema, no son codigo fuente
+data/*.json
+data/*.xlsx
+data/*.csv
+data/historial_dias/*.json
+!data/.gitkeep
+!data/historial_dias/.gitkeep

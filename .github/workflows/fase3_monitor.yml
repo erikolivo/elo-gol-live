@@ -1,0 +1,63 @@
+name: Fase 3 - Vigilancia en vivo
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "30 5 * * *"
+    - cron: "0 11 * * *"
+    - cron: "30 16 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: fase3-monitor
+  cancel-in-progress: false
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Configurar git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Loop de vigilancia (5.5h, revisa cada 5 min, commitea tras cada revision)
+        run: |
+          FIN=$((SECONDS + 19800))
+          while [ $SECONDS -lt $FIN ]; do
+            echo "=== Revision $(date -u +%H:%M:%S) UTC ==="
+            python monitor.py || echo "[AVISO] monitor.py fallo esta vuelta, se reintenta en el siguiente ciclo."
+
+            mkdir -p data data/historial_dias
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Sin cambios para commitear esta vuelta."
+            else
+              git commit -m "Fase 3: revision en vivo $(date -u +%H:%M:%S)"
+              for i in 1 2 3 4 5; do
+                git pull --rebase origin "${GITHUB_REF_NAME}" && git push && break
+                echo "Push fallo (intento $i), reintentando en 5s..."
+                sleep 5
+              done
+            fi
+
+            sleep 300
+          done
+          echo "Ciclo de 5.5h completado."

@@ -113,8 +113,16 @@ def obtener_ranking_clubelo(fecha="today"):
         if CACHE_RANKING.exists():
             print(f"[AVISO] ClubElo no respondio tras varios intentos ({e}). Usando cache.")
             return list(csv.DictReader(io.StringIO(CACHE_RANKING.read_text(encoding="utf-8"))))
-        print("[AVISO] ClubElo no respondio y no hay cache previo disponible.")
-        raise
+        # NOTA: en GitHub Actions este archivo de cache casi nunca existe
+        # (cada corrida arranca con un checkout limpio del repo), asi que
+        # este es el camino real en producción cuando ClubElo falla.
+        # No se relanza el error: seleccionar_partidos.py ya sabe operar
+        # sin ranking de ClubElo (calibra con Goal Index y usa Glicko-2
+        # propio con 1500/RD=350 para equipos nuevos), asi que es mejor
+        # seguir en modo degradado que perder la corrida completa del dia.
+        print(f"[AVISO] ClubElo no respondio tras varios intentos ({e}) y no hay cache previo. "
+              f"Se continua sin ranking de ClubElo (modo degradado: Goal Index + Glicko-2 propio).")
+        return []
 
 
 def obtener_historial_club(nombre_club):

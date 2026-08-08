@@ -55,21 +55,38 @@ def _headers_api_football():
     return {"x-apisports-key": API_FOOTBALL_KEY}
 
 
-def _api_football_request(endpoint, params=None, timeout=20):
+def _api_football_request(endpoint, params=None, timeout=20, intentos=3):
     """
     Punto unico por donde pasan TODAS las llamadas a API-Football.
     Si la API responde 429 (cupo diario agotado), se marca el contador
     LOCAL como agotado de inmediato -- sin esto, el resto de la misma
     corrida seguiria intentando peticiones que sabemos que van a fallar.
+
+    Reintenta solo ante fallos de red transitorios (timeout/conexion),
+    NO ante 429 (ya se maneja aparte) ni otros errores HTTP (reintentar
+    ahi no ayuda y solo gastaria cupo). Pocos intentos y espera corta
+    porque esta funcion se llama muchas veces por ciclo de vigilancia.
     """
     from cuota_api_football import registrar_uso, marcar_agotado
 
-    r = requests.get(
-        f"{API_FOOTBALL_BASE}/{endpoint}",
-        headers=_headers_api_football(),
-        params=params,
-        timeout=timeout,
-    )
+    ultimo_error = None
+    for intento in range(1, intentos + 1):
+        try:
+            r = requests.get(
+                f"{API_FOOTBALL_BASE}/{endpoint}",
+                headers=_headers_api_football(),
+                params=params,
+                timeout=timeout,
+            )
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            ultimo_error = e
+            print(f"[AVISO] Intento {intento}/{intentos} fallo para API-Football/{endpoint}: {e}")
+            if intento < intentos:
+                time.sleep(3 * intento)
+    else:
+        raise ultimo_error
+
     if r.status_code == 429:
         marcar_agotado()
     r.raise_for_status()

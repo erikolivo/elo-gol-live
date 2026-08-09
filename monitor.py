@@ -61,9 +61,19 @@ ARCHIVO_ESTADO_MONITOR = DATA_DIR / "estado_monitor.json"
 MINUTOS_ANTES_DEL_INICIO = 10
 MINUTOS_DURACION_MAXIMA = 130
 
-UMBRAL_POCOS_PARTIDOS = 5
-INTERVALO_POCOS = 10
-INTERVALO_MUCHOS = 15
+# OPTIMIZACION DE CONSUMO (aprobado por Erik, ver conversacion):
+# 1. La consulta base obtener_partidos_en_vivo() (1 peticion) siempre trae
+#    TODOS los partidos en vivo a la vez -- no se toca, ya es barata.
+# 2. Antes de este minuto no se piden stats/eventos (2 peticiones/partido)
+#    para ningun partido -- casi no hay alertas relevantes tan temprano
+#    de todos modos (ver MINUTO_MIN_ALERTA_GENERAL mas abajo).
+MINUTO_INICIO_DETALLE = 15
+# 3. El intervalo de revision detallada (stats+eventos) ya NO es global
+#    para todos los partidos -- es POR PARTIDO, segun que tan activo
+#    estuvo desde su ultima revision (ver _actividad_reciente()).
+INTERVALO_PARTIDO_ACTIVO = 10     # partido con tiros a puerta/corners recientes
+INTERVALO_PARTIDO_TRANQUILO = 15  # partido sin mucho movimiento reciente
+UMBRAL_ACTIVIDAD_RECIENTE = 3     # tiros a puerta + corners combinados desde la ultima revision
 
 MINUTO_MIN_ALERTA_GENERAL = 15
 MINUTO_MAX_ALERTA_GENERAL = 75
@@ -84,47 +94,63 @@ def _en_ventana(kickoff_utc_iso, ahora=None):
            (kickoff + timedelta(minutes=MINUTOS_DURACION_MAXIMA))
 
 
-def _debe_revisar_ahora(cantidad_en_ventana):
-    """
-    CORRECCION IMPORTANTE (bug detectado en produccion): la version
-    anterior decidia "toca revisar" comparando minuto_actual % intervalo
-    == 0. Como el loop interno de Fase 3 avanza de 5 en 5 minutos desde
-    un minuto de arranque arbitrario (segun cuando el job realmente
-    empieza a correr, no necesariamente alineado a :00), el residuo
-    podia quedar atrapado para siempre en un valor que nunca es multiplo
-    del intervalo (ej. arrancando en minuto 2: la secuencia 2,7,12,17,22...
-    modulo 10 alterna entre 2 y 7 ETERNAMENTE, nunca toca 0) -- el
-    resultado real fue que Fase 3 nunca revisaba nada.
-
-    La correccion: en vez de depender del reloj, se guarda la hora real
-    de la ULTIMA revision efectiva (data/estado_monitor.json) y se
-    compara cuanto tiempo transcurrio de verdad desde entonces. Esto
-    funciona sin importar en que minuto arranco el job.
-    """
-    intervalo_min = INTERVALO_POCOS if cantidad_en_ventana <= UMBRAL_POCOS_PARTIDOS else INTERVALO_MUCHOS
-    ahora = datetime.now(timezone.utc)
-
-    estado = {}
+def _cargar_estado_monitor():
     if ARCHIVO_ESTADO_MONITOR.exists():
         try:
-            estado = json.loads(ARCHIVO_ESTADO_MONITOR.read_text(encoding="utf-8"))
+            return json.loads(ARCHIVO_ESTADO_MONITOR.read_text(encoding="utf-8"))
         except Exception:
-            estado = {}
+            return {}
+    return {}
 
-    ultima_str = estado.get("ultima_revision_utc")
-    if ultima_str:
-        try:
-            ultima = datetime.fromisoformat(ultima_str)
-            minutos_transcurridos = (ahora - ultima).total_seconds() / 60
-            if minutos_transcurridos < intervalo_min:
-                return False
-        except Exception:
-            pass  # estado corrupto: mejor revisar ahora que quedarse atascado
 
-    estado["ultima_revision_utc"] = ahora.isoformat()
+def _guardar_estado_monitor(estado):
     DATA_DIR.mkdir(exist_ok=True)
     ARCHIVO_ESTADO_MONITOR.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
-    return True
+
+
+def _debe_revisar_fixture(fixture_id, estado, ahora):
+    """
+    CORRECCION IMPORTANTE (bug detectado en produccion, se mantiene el
+    mismo fix de fondo): no se decide comparando minuto_actual % intervalo
+    == 0 (eso podia quedar atrapado en un residuo que nunca es multiplo
+    del intervalo). Se compara el tiempo REAL transcurrido desde la
+    ultima revision efectiva de ESTE partido en particular.
+
+    A diferencia de la version anterior, el intervalo ya no es global
+    para todos los partidos -- cada fixture_id tiene su propio intervalo
+    (10 o 15 min) segun que tan activo estuvo la ultima vez que se
+    revisó (ver _actividad_reciente()), guardado en
+    data/estado_monitor.json bajo "fixtures".
+    """
+    info = estado.get("fixtures", {}).get(str(fixture_id))
+    if not info:
+        return True  # primera revision detallada de este partido: siempre toca
+    intervalo_min = info.get("intervalo_min", INTERVALO_PARTIDO_ACTIVO)
+    try:
+        ultima = datetime.fromisoformat(info["ultima_revision_utc"])
+    except Exception:
+        return True  # estado corrupto: mejor revisar ahora que quedarse atascado
+    minutos_transcurridos = (ahora - ultima).total_seconds() / 60
+    return minutos_transcurridos >= intervalo_min
+
+
+def _actividad_reciente(snap_actual, snap_anterior):
+    """
+    Señal simple de "este partido esta atacando ahora mismo": tiros a
+    puerta + corners combinados de ambos equipos, comparados contra la
+    revision anterior. Por encima del umbral -> partido activo, se
+    revisa cada INTERVALO_PARTIDO_ACTIVO min. Por debajo -> partido
+    tranquilo, se revisa cada INTERVALO_PARTIDO_TRANQUILO min.
+    Sin revision anterior (primera vez) -> se asume activo por
+    seguridad, para no perderse el arranque de un partido movido.
+    """
+    if snap_anterior is None:
+        return True
+    actual = (snap_actual["tiros_puerta_local"] + snap_actual["tiros_puerta_visitante"] +
+              snap_actual["corners_local"] + snap_actual["corners_visitante"])
+    anterior = (snap_anterior["tiros_puerta_local"] + snap_anterior["tiros_puerta_visitante"] +
+                snap_anterior["corners_local"] + snap_anterior["corners_visitante"])
+    return (actual - anterior) >= UMBRAL_ACTIVIDAD_RECIENTE
 
 
 def _valor_stat(stats_equipo, nombre_stat):
@@ -416,16 +442,14 @@ def revisar():
         print("Ningún partido vigilado está en su ventana horaria ahora (0 peticiones gastadas).")
         return
 
-    if not _debe_revisar_ahora(len(en_ventana)):
-        print(f"Frecuencia adaptativa: con {len(en_ventana)} partido(s) en ventana, "
-              f"todavía no toca revisar en este ciclo de 5 min.")
-        return
-
     print(f"Consultando partidos en vivo ({len(en_ventana)} en ventana, 1 petición)...")
     en_vivo = obtener_partidos_en_vivo()
     en_vivo_por_id = {f["fixture"]["id"]: f for f in en_vivo}
 
+    estado_monitor = _cargar_estado_monitor()
+    ahora = datetime.now(timezone.utc)
     cambios = False
+    cambios_estado = False
 
     for p in en_ventana:
         fixture = en_vivo_por_id.get(p["fixture_id"])
@@ -438,6 +462,12 @@ def revisar():
 
         goles_local = fixture["goals"]["home"] or 0
         goles_visitante = fixture["goals"]["away"] or 0
+
+        if minuto < MINUTO_INICIO_DETALLE:
+            continue  # se pospone stats/eventos hasta el minuto 15 (ahorra 2 peticiones/partido)
+
+        if not _debe_revisar_fixture(p["fixture_id"], estado_monitor, ahora):
+            continue  # a este partido en particular todavia no le toca (intervalo individual)
 
         try:
             stats = obtener_estadisticas_fixture(p["fixture_id"])
@@ -458,6 +488,16 @@ def revisar():
         stats_local, stats_visitante = stats[0], stats[1]
         snap_actual = _snapshot(stats_local, stats_visitante, minuto, goles_local, goles_visitante)
         snap_anterior = p["historial_snapshots"][-1] if p["historial_snapshots"] else None
+
+        # Se decide aqui el intervalo de la PROXIMA revision de este
+        # partido en particular, segun que tan activo estuvo desde la
+        # ultima vez -- no afecta a los demas partidos en ventana.
+        activo = _actividad_reciente(snap_actual, snap_anterior)
+        estado_monitor.setdefault("fixtures", {})[str(p["fixture_id"])] = {
+            "ultima_revision_utc": ahora.isoformat(),
+            "intervalo_min": INTERVALO_PARTIDO_ACTIVO if activo else INTERVALO_PARTIDO_TRANQUILO,
+        }
+        cambios_estado = True
 
         diferencia_actual = abs((goles_local if p["favorito_es_local"] else goles_visitante) -
                                  (goles_visitante if p["favorito_es_local"] else goles_local))
@@ -486,6 +526,8 @@ def revisar():
                     p["marcado_resuelto"] = True
                 print(f"Alerta '{tipo}' enviada: {p['partido']} (min {minuto}, prob {probabilidad*100:.0f}%)")
 
+    if cambios_estado:
+        _guardar_estado_monitor(estado_monitor)
     if cambios:
         ARCHIVO_PARTIDOS.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
     else:

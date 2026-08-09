@@ -1,5 +1,8 @@
 name: Fase 4 - Cierre de resultados
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "*/15 4-5 * * *"

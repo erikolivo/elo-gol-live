@@ -1,5 +1,8 @@
 name: Fase 3 - Vigilancia en vivo
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "0 0 * * *"

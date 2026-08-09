@@ -1,7 +1,11 @@
 name: Fase 2 - Resumen diario
 
+permissions:
+  contents: write
+
 on:
   schedule:
+    - cron: "30,45 11 * * *"
     - cron: "*/15 12-13 * * *"
   workflow_dispatch: {}
 

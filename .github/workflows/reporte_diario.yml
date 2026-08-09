@@ -1,5 +1,8 @@
 name: Reporte diario (6am)
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "*/15 11 * * *"
